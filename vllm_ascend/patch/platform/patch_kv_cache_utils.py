@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -24,6 +25,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.core.kv_cache_memory import (
+    minimax_pp_bytes_per_block,
+    uses_minimax_pp_group_compensation,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -52,6 +57,7 @@ if vllm_version_is("0.31.0"):
     from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 else:
     import vllm.v1.core.kv_cache_planning as _kv_cache_planning
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
     from vllm.v1.core.kv_cache_planning import _approximate_gcd, may_override_num_blocks
 
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
@@ -63,6 +69,7 @@ _orig_get_packed_kv_cache_groups = _kv_cache_planning._get_packed_kv_cache_group
 _orig_get_kv_cache_config_from_groups = _kv_cache_planning.get_kv_cache_config_from_groups
 _orig_max_memory_usage_bytes_from_groups = _kv_cache_planning._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = _kv_cache_planning._pool_bytes_per_block
+_orig_get_kv_cache_configs = _kv_cache_planning.get_kv_cache_configs
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
 
     def _uniform_type_max_num_blocks_per_req(
@@ -754,6 +761,49 @@ def _ascend_get_kv_cache_config_from_groups(
     return kv_cache_config
 
 
+def _ascend_get_kv_cache_configs(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Compensate budgets from final groups before upstream planning."""
+    if not uses_minimax_pp_group_compensation(vllm_config):
+        return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory)
+
+    merged_specs: dict[str, KVCacheSpec] = {}
+    for worker_specs in kv_cache_specs:
+        for name, spec in worker_specs.items():
+            if name in merged_specs and merged_specs[name] != spec:
+                raise ValueError(f"Inconsistent KV cache spec across workers: {name}")
+            merged_specs[name] = spec
+    # Grouping may replace specs while aligning pages. Preserve upstream inputs.
+    if vllm_version_is("0.31.0"):
+        global_groups = _kv_cache_planning.get_kv_cache_groups(vllm_config, deepcopy(merged_specs))
+    else:
+        builder = get_kv_cache_config_builder(vllm_config)
+        global_groups = _kv_cache_planning.get_kv_cache_groups_from_builder(
+            builder, vllm_config, deepcopy(merged_specs)
+        )
+    adjusted_memory: list[int] = []
+    for worker_specs, budget in zip(kv_cache_specs, available_memory):
+        groups = _kv_cache_planning._project_kv_cache_groups_to_worker(global_groups, worker_specs)
+        if not groups:
+            logical_bytes = 0
+        elif vllm_version_is("0.31.0"):
+            logical_bytes = _orig_pool_bytes_per_block(groups)
+        else:
+            logical_bytes = _kv_cache_planning._pool_bytes_per_block_from_builder(
+                builder, vllm_config, groups
+            )
+        physical_bytes = minimax_pp_bytes_per_block(groups)
+        compensated = (
+            budget * logical_bytes // physical_bytes
+            if physical_bytes > logical_bytes > 0 else budget
+        )
+        adjusted_memory.append(compensated)
+    return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, adjusted_memory)
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 assert _orig_get_packed_kv_cache_groups is not None
 _kv_cache_planning._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
@@ -770,3 +820,7 @@ _kv_cache_planning._pool_bytes_per_block = _ascend_pool_bytes_per_block
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+
+# Remove this wrapper when upstream supports final-group backend budget compensation.
+_kv_cache_planning.get_kv_cache_configs = _ascend_get_kv_cache_configs
+vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs

@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 
 from contextlib import nullcontext
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.worker.gpu import model_runner as upstream
 
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_memory import minimax_pp_bytes_per_block
+from vllm_ascend.patch.platform import patch_kv_cache_utils as planner_patch
 from vllm_ascend.patch.worker.patch_v2 import patch_model_runner  # noqa: F401
 
 
@@ -114,3 +118,78 @@ def test_mrv2_block_copy_preserves_segmented_mamba_storage():
     torch.testing.assert_close(ssm[2], before_ssm[0])
     torch.testing.assert_close(conv[:2], before_conv[:2])
     torch.testing.assert_close(ssm[:2], before_ssm[:2])
+
+
+def test_minimax_pp_cost_counts_final_pages_and_ignores_empty_groups():
+    """Final projected pages, not local pre-grouping pages, bound allocation."""
+    main = FullAttentionSpec(
+        block_size=256, num_kv_heads=4, head_size=128, dtype=torch.float8_e4m3fn
+    )
+    index = AscendSFAIndexerCacheSpec(
+        block_size=2048, num_kv_heads=1, head_size=128,
+        dtype=torch.float8_e4m3fn, cache_dtype_str="fp8",
+    )
+    groups = [KVCacheGroupSpec([], main)]
+    for layer in range(8):
+        groups.append(KVCacheGroupSpec([f"layer.{layer}.main"], main))
+        groups.append(KVCacheGroupSpec([f"layer.{layer}.index"], index))
+    physical_bytes = minimax_pp_bytes_per_block(groups)
+    assert physical_bytes == 4194304
+    available = 13700639641
+    blocks = available // physical_bytes
+    assert blocks == 3266
+    assert blocks * physical_bytes <= available < (blocks + 1) * physical_bytes
+
+
+@pytest.mark.parametrize("budget", [13700639641, 21821084876])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_minimax_pp_compensates_budget_using_global_projected_specs(monkeypatch, budget, legacy):
+    """Shrink only the budget; preserve upstream inputs and planning entry."""
+    main = FullAttentionSpec(
+        block_size=256, num_kv_heads=4, head_size=128, dtype=torch.float8_e4m3fn
+    )
+    index = AscendSFAIndexerCacheSpec(
+        block_size=2048, num_kv_heads=1, head_size=128,
+        dtype=torch.float8_e4m3fn, cache_dtype_str="fp8",
+    )
+    groups = []
+    worker_specs = {}
+    for layer in range(8):
+        for kind, spec in (("main", main), ("index", index)):
+            name = f"layer.{layer}.{kind}"
+            groups.append(KVCacheGroupSpec([name], spec))
+            worker_specs[name] = replace(spec, block_size=256)
+    specs = [worker_specs]
+    budgets = [budget]
+    expected = budget // 16
+    sentinel = object()
+    monkeypatch.setattr(planner_patch, "uses_minimax_pp_group_compensation", lambda _: True)
+    monkeypatch.setattr(planner_patch, "vllm_version_is", lambda _: legacy)
+    monkeypatch.setattr(planner_patch, "_orig_pool_bytes_per_block", lambda _: main.page_size_bytes)
+    planning = planner_patch._kv_cache_planning
+    monkeypatch.setattr(planning, "get_kv_cache_groups", lambda config, merged: groups)
+    monkeypatch.setattr(
+        planner_patch, "get_kv_cache_config_builder", lambda _: sentinel, raising=False
+    )
+    monkeypatch.setattr(
+        planning, "get_kv_cache_groups_from_builder",
+        lambda builder, config, merged: groups, raising=False,
+    )
+    monkeypatch.setattr(
+        planning, "_pool_bytes_per_block_from_builder",
+        lambda builder, config, projected: main.page_size_bytes, raising=False,
+    )
+    calls = []
+
+    def upstream_plan(config, actual_specs, actual_budgets):
+        calls.append((actual_specs, actual_budgets))
+        return sentinel
+
+    monkeypatch.setattr(planner_patch, "_orig_get_kv_cache_configs", upstream_plan)
+    result = planner_patch._ascend_get_kv_cache_configs(MagicMock(), specs, budgets)
+    assert result is sentinel
+    assert calls == [(specs, [expected])]
+    assert calls[0][0] is specs
+    assert budgets == [budget]
+    assert expected // main.page_size_bytes == budget // (16 * main.page_size_bytes)
+    assert worker_specs["layer.0.index"].block_size == 256
