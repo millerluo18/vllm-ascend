@@ -801,7 +801,12 @@ def _ascend_get_kv_cache_configs(
             if physical_bytes > logical_bytes > 0 else budget
         )
         adjusted_memory.append(compensated)
-    return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, adjusted_memory)
+    previous_skip = getattr(vllm_config, "_ascend_skip_minimax_pp_capacity_check", False)
+    vllm_config._ascend_skip_minimax_pp_capacity_check = True
+    try:
+        return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, adjusted_memory)
+    finally:
+        vllm_config._ascend_skip_minimax_pp_capacity_check = previous_skip
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes

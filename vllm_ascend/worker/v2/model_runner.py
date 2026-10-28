@@ -399,6 +399,11 @@ class NPUModelRunner(GPUModelRunner):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
+        if (
+            self.pp_handler is not None
+            and self.model_config.hf_text_config.model_type == "minimax_m3_text"
+        ):
+            self.pp_handler.broadcast_stream.synchronize()
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
         self._finalize_dump_data()

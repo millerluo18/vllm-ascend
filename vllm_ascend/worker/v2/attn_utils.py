@@ -1685,9 +1685,15 @@ def _reshape_kv_cache_v2(
                 num_blocks = sum_page_size_bytes // group_spec.page_size_bytes
                 assert num_blocks >= kv_cache_config.num_blocks
 
+                index_block_size = group_spec.block_size
+                index_num_blocks = num_blocks * group_spec.sfa_dcp_replicated_indexer_size
+                if group.backend.get_name() == "ASCEND_MINIMAX_M3_SPARSE_INDEXER":
+                    assert group_spec.block_size % kernel_block_size == 0
+                    index_num_blocks *= group_spec.block_size // kernel_block_size
+                    index_block_size = kernel_block_size
                 kv_cache_shape = group.backend.get_kv_cache_shape(
-                    num_blocks * group_spec.sfa_dcp_replicated_indexer_size,
-                    group_spec.block_size,
+                    index_num_blocks,
+                    index_block_size,
                     group_spec.num_kv_heads,
                     group_spec.head_size,
                 )

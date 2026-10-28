@@ -661,6 +661,26 @@ class NPUWorker(WorkerBase):
         """
         GiB = lambda b: b / GiB_bytes
 
+        if uses_minimax_pp_group_compensation(self.vllm_config):
+            pp = get_pp_group()
+            token = torch.zeros(1, dtype=torch.int64, device=self.device)
+            for source in range(pp.world_size - 1):
+                if pp.rank_in_group == source:
+                    torch.distributed.isend(
+                        token, dst=pp.ranks[source + 1], group=pp.device_group
+                    ).wait()
+                elif pp.rank_in_group == source + 1:
+                    torch.distributed.irecv(
+                        token, src=pp.ranks[source], group=pp.device_group
+                    ).wait()
+            torch.distributed.broadcast(
+                token, src=pp.last_rank,
+                group=self.model_runner.pp_handler.broadcast_group,
+            )
+            torch.npu.synchronize()
+            del token
+            torch.npu.empty_cache()
+
         maybe_apply_startup_plan(self)
 
         randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and self.parallel_config.data_parallel_size > 1
@@ -939,6 +959,11 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if uses_minimax_pp_group_compensation(self.vllm_config):
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+            torch.npu.current_stream().synchronize()
         output = self.model_runner.sample_tokens(grammar_output)
         _attach_profiling_chunk_execution_time(
             self.model_runner.ascend_config.scheduler_config.profiling_chunk_config,

@@ -1,0 +1,380 @@
+From 0ebea64702344bedb3d46caa9da11db7da42d43a Mon Sep 17 00:00:00 2001
+From: millerluo18 <193638369@qq.com>
+Date: Wed, 28 Oct 2026 17:19:18 +0800
+Subject: [PATCH] minimax-m3 a5 pp oom bugfix
+
+---
+ .../worker/test_model_runner_v2_kv_cache.py   | 81 ++++++++++++++++++-
+ vllm_ascend/core/kv_cache_memory.py           | 53 ++++++++++++
+ .../patch/platform/patch_kv_cache_utils.py    | 59 ++++++++++++++
+ vllm_ascend/worker/v2/attn_utils.py           | 10 ++-
+ vllm_ascend/worker/v2/model_runner.py         |  5 ++
+ vllm_ascend/worker/worker.py                  | 28 +++++++
+ 6 files changed, 233 insertions(+), 3 deletions(-)
+ create mode 100644 vllm_ascend/core/kv_cache_memory.py
+
+diff --git a/tests/ut/worker/test_model_runner_v2_kv_cache.py b/tests/ut/worker/test_model_runner_v2_kv_cache.py
+index 373b3e24f..d99f1eebe 100644
+--- a/tests/ut/worker/test_model_runner_v2_kv_cache.py
++++ b/tests/ut/worker/test_model_runner_v2_kv_cache.py
+@@ -2,14 +2,18 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
+ 
+ from contextlib import nullcontext
++from dataclasses import replace
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+-from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+ from vllm.v1.worker.gpu import model_runner as upstream
+ 
++from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
++from vllm_ascend.core.kv_cache_memory import minimax_pp_bytes_per_block
++from vllm_ascend.patch.platform import patch_kv_cache_utils as planner_patch
+ from vllm_ascend.patch.worker.patch_v2 import patch_model_runner  # noqa: F401
+ 
+ 
+@@ -114,3 +118,78 @@ def test_mrv2_block_copy_preserves_segmented_mamba_storage():
+     torch.testing.assert_close(ssm[2], before_ssm[0])
+     torch.testing.assert_close(conv[:2], before_conv[:2])
+     torch.testing.assert_close(ssm[:2], before_ssm[:2])
++
++
++def test_minimax_pp_cost_counts_final_pages_and_ignores_empty_groups():
++    """Final projected pages, not local pre-grouping pages, bound allocation."""
++    main = FullAttentionSpec(
++        block_size=256, num_kv_heads=4, head_size=128, dtype=torch.float8_e4m3fn
++    )
++    index = AscendSFAIndexerCacheSpec(
++        block_size=2048, num_kv_heads=1, head_size=128,
++        dtype=torch.float8_e4m3fn, cache_dtype_str="fp8",
++    )
++    groups = [KVCacheGroupSpec([], main)]
++    for layer in range(8):
++        groups.append(KVCacheGroupSpec([f"layer.{layer}.main"], main))
++        groups.append(KVCacheGroupSpec([f"layer.{layer}.index"], index))
++    physical_bytes = minimax_pp_bytes_per_block(groups)
++    assert physical_bytes == 4194304
++    available = 13700639641
++    blocks = available // physical_bytes
++    assert blocks == 3266
++    assert blocks * physical_bytes <= available < (blocks + 1) * physical_bytes
++
++
++@pytest.mark.parametrize("budget", [13700639641, 21821084876])
++@pytest.mark.parametrize("legacy", [False, True])
++def test_minimax_pp_compensates_budget_using_global_projected_specs(monkeypatch, budget, legacy):
++    """Shrink only the budget; preserve upstream inputs and planning entry."""
++    main = FullAttentionSpec(
++        block_size=256, num_kv_heads=4, head_size=128, dtype=torch.float8_e4m3fn
++    )
++    index = AscendSFAIndexerCacheSpec(
++        block_size=2048, num_kv_heads=1, head_size=128,
++        dtype=torch.float8_e4m3fn, cache_dtype_str="fp8",
++    )
++    groups = []
++    worker_specs = {}
++    for layer in range(8):
++        for kind, spec in (("main", main), ("index", index)):
++            name = f"layer.{layer}.{kind}"
++            groups.append(KVCacheGroupSpec([name], spec))
++            worker_specs[name] = replace(spec, block_size=256)
++    specs = [worker_specs]
++    budgets = [budget]
++    expected = budget // 16
++    sentinel = object()
++    monkeypatch.setattr(planner_patch, "uses_minimax_pp_group_compensation", lambda _: True)
++    monkeypatch.setattr(planner_patch, "vllm_version_is", lambda _: legacy)
++    monkeypatch.setattr(planner_patch, "_orig_pool_bytes_per_block", lambda _: main.page_size_bytes)
++    planning = planner_patch._kv_cache_planning
++    monkeypatch.setattr(planning, "get_kv_cache_groups", lambda config, merged: groups)
++    monkeypatch.setattr(
++        planner_patch, "get_kv_cache_config_builder", lambda _: sentinel, raising=False
++    )
++    monkeypatch.setattr(
++        planning, "get_kv_cache_groups_from_builder",
++        lambda builder, config, merged: groups, raising=False,
++    )
++    monkeypatch.setattr(
++        planning, "_pool_bytes_per_block_from_builder",
++        lambda builder, config, projected: main.page_size_bytes, raising=False,
++    )
++    calls = []
++
++    def upstream_plan(config, actual_specs, actual_budgets):
++        calls.append((actual_specs, actual_budgets))
++        return sentinel
++
++    monkeypatch.setattr(planner_patch, "_orig_get_kv_cache_configs", upstream_plan)
++    result = planner_patch._ascend_get_kv_cache_configs(MagicMock(), specs, budgets)
++    assert result is sentinel
++    assert calls == [(specs, [expected])]
++    assert calls[0][0] is specs
++    assert budgets == [budget]
++    assert expected // main.page_size_bytes == budget // (16 * main.page_size_bytes)
++    assert worker_specs["layer.0.index"].block_size == 256
+diff --git a/vllm_ascend/core/kv_cache_memory.py b/vllm_ascend/core/kv_cache_memory.py
+new file mode 100644
+index 000000000..290b88efd
+--- /dev/null
++++ b/vllm_ascend/core/kv_cache_memory.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
++
++from vllm import envs
++from vllm.config import VllmConfig
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheGroupSpec,
++    UniformTypeKVCacheSpecs,
++)
++
++from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
++
++
++def uses_minimax_pp_group_compensation(config: VllmConfig) -> bool:
++    """Select the device-resident MiniMax V2 PP allocation path."""
++    model = config.model_config
++    parallel = config.parallel_config
++    return (
++        model is not None
++        and model.hf_text_config.model_type == "minimax_m3_text"
++        and envs.VLLM_USE_V2_MODEL_RUNNER
++        and parallel.pipeline_parallel_size > 1
++        and parallel.decode_context_parallel_size == 1
++        and parallel.prefill_context_parallel_size == 1
++        and config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
++        and config.cache_config.num_gpu_blocks_override is None
++        and not (config.additional_config or {}).get("enable_kvpp", False)
++        and config.kv_transfer_config is None
++        and config.speculative_config is None
++        and config.attention_config.hisparse_config is None
++        and not (config.additional_config or {}).get("sparse_kv_offload_config", {}).get("enabled", False)
++    )
++
++
++def minimax_pp_bytes_per_block(groups: list[KVCacheGroupSpec]) -> int:
++    """Count the private per-layer pages the V2 allocator materializes."""
++    total = 0
++    seen: set[str] = set()
++    for group in groups:
++        if group.host_resident:
++            raise ValueError("MiniMax PP physical budgeting requires device-resident caches")
++        for name in group.layer_names:
++            if name in seen:
++                raise ValueError(f"Duplicate MiniMax KV cache layer: {name}")
++            seen.add(name)
++            spec = group.kv_cache_spec
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                spec = spec.kv_cache_specs[name]
++            if type(spec) is not FullAttentionSpec and not isinstance(spec, AscendSFAIndexerCacheSpec):
++                raise ValueError(f"Unsupported MiniMax PP KV cache spec: {type(spec).__name__}")
++            total += spec.page_size_bytes
++    return total
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_utils.py b/vllm_ascend/patch/platform/patch_kv_cache_utils.py
+index e1d190490..d4f7f39e5 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_utils.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
+ import math
+ from collections import defaultdict
++from copy import deepcopy
+ from dataclasses import replace
+ from typing import Any
+ 
+@@ -24,6 +25,10 @@ from vllm.v1.kv_cache_interface import (
+ )
+ 
+ from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
++from vllm_ascend.core.kv_cache_memory import (
++    minimax_pp_bytes_per_block,
++    uses_minimax_pp_group_compensation,
++)
+ from vllm_ascend.models.deepseek_v41.cache_config import (
+     get_deepseek_v41_kv_cache_config,
+     get_deepseek_v41_pool_bytes_per_block,
+@@ -52,6 +57,7 @@ if vllm_version_is("0.31.0"):
+     from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
+ else:
+     import vllm.v1.core.kv_cache_planning as _kv_cache_planning
++    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+     from vllm.v1.core.kv_cache_planning import _approximate_gcd, may_override_num_blocks
+ 
+ _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
+@@ -63,6 +69,7 @@ _orig_get_packed_kv_cache_groups = _kv_cache_planning._get_packed_kv_cache_group
+ _orig_get_kv_cache_config_from_groups = _kv_cache_planning.get_kv_cache_config_from_groups
+ _orig_max_memory_usage_bytes_from_groups = _kv_cache_planning._max_memory_usage_bytes_from_groups
+ _orig_pool_bytes_per_block = _kv_cache_planning._pool_bytes_per_block
++_orig_get_kv_cache_configs = _kv_cache_planning.get_kv_cache_configs
+ if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
+ 
+     def _uniform_type_max_num_blocks_per_req(
+@@ -754,6 +761,54 @@ def _ascend_get_kv_cache_config_from_groups(
+     return kv_cache_config
+ 
+ 
++def _ascend_get_kv_cache_configs(
++    vllm_config: VllmConfig,
++    kv_cache_specs: list[dict[str, KVCacheSpec]],
++    available_memory: list[int],
++) -> list[KVCacheConfig]:
++    """Compensate budgets from final groups before upstream planning."""
++    if not uses_minimax_pp_group_compensation(vllm_config):
++        return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory)
++
++    merged_specs: dict[str, KVCacheSpec] = {}
++    for worker_specs in kv_cache_specs:
++        for name, spec in worker_specs.items():
++            if name in merged_specs and merged_specs[name] != spec:
++                raise ValueError(f"Inconsistent KV cache spec across workers: {name}")
++            merged_specs[name] = spec
++    # Grouping may replace specs while aligning pages. Preserve upstream inputs.
++    if vllm_version_is("0.31.0"):
++        global_groups = _kv_cache_planning.get_kv_cache_groups(vllm_config, deepcopy(merged_specs))
++    else:
++        builder = get_kv_cache_config_builder(vllm_config)
++        global_groups = _kv_cache_planning.get_kv_cache_groups_from_builder(
++            builder, vllm_config, deepcopy(merged_specs)
++        )
++    adjusted_memory: list[int] = []
++    for worker_specs, budget in zip(kv_cache_specs, available_memory):
++        groups = _kv_cache_planning._project_kv_cache_groups_to_worker(global_groups, worker_specs)
++        if not groups:
++            logical_bytes = 0
++        elif vllm_version_is("0.31.0"):
++            logical_bytes = _orig_pool_bytes_per_block(groups)
++        else:
++            logical_bytes = _kv_cache_planning._pool_bytes_per_block_from_builder(
++                builder, vllm_config, groups
++            )
++        physical_bytes = minimax_pp_bytes_per_block(groups)
++        compensated = (
++            budget * logical_bytes // physical_bytes
++            if physical_bytes > logical_bytes > 0 else budget
++        )
++        adjusted_memory.append(compensated)
++    previous_skip = getattr(vllm_config, "_ascend_skip_minimax_pp_capacity_check", False)
++    vllm_config._ascend_skip_minimax_pp_capacity_check = True
++    try:
++        return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, adjusted_memory)
++    finally:
++        vllm_config._ascend_skip_minimax_pp_capacity_check = previous_skip
++
++
+ vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+ assert _orig_get_packed_kv_cache_groups is not None
+ _kv_cache_planning._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
+@@ -770,3 +825,7 @@ _kv_cache_planning._pool_bytes_per_block = _ascend_pool_bytes_per_block
+ import vllm.v1.engine.core  # noqa: E402
+ 
+ vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
++
++# Remove this wrapper when upstream supports final-group backend budget compensation.
++_kv_cache_planning.get_kv_cache_configs = _ascend_get_kv_cache_configs
++vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs
+diff --git a/vllm_ascend/worker/v2/attn_utils.py b/vllm_ascend/worker/v2/attn_utils.py
+index 1bbcb2163..7559ff583 100644
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -1685,9 +1685,15 @@ def _reshape_kv_cache_v2(
+                 num_blocks = sum_page_size_bytes // group_spec.page_size_bytes
+                 assert num_blocks >= kv_cache_config.num_blocks
+ 
++                index_block_size = group_spec.block_size
++                index_num_blocks = num_blocks * group_spec.sfa_dcp_replicated_indexer_size
++                if group.backend.get_name() == "ASCEND_MINIMAX_M3_SPARSE_INDEXER":
++                    assert group_spec.block_size % kernel_block_size == 0
++                    index_num_blocks *= group_spec.block_size // kernel_block_size
++                    index_block_size = kernel_block_size
+                 kv_cache_shape = group.backend.get_kv_cache_shape(
+-                    num_blocks * group_spec.sfa_dcp_replicated_indexer_size,
+-                    group_spec.block_size,
++                    index_num_blocks,
++                    index_block_size,
+                     group_spec.num_kv_heads,
+                     group_spec.head_size,
+                 )
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 9f132a72c..b1414643c 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -399,6 +399,11 @@ class NPUModelRunner(GPUModelRunner):
+             pcp_manager._sampling_hidden_restored = False
+         self._restore_replicated_draft_target_states()
+         output = super().sample_tokens(grammar_output)
++        if (
++            self.pp_handler is not None
++            and self.model_config.hf_text_config.model_type == "minimax_m3_text"
++        ):
++            self.pp_handler.broadcast_stream.synchronize()
+         # Close the per-step msprobe dump cycle on the normal last-PP-rank
+         # path (v1 parity: v1 finalizes at the end of sample_tokens).
+         self._finalize_dump_data()
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 8b1964b00..15faf9a3e 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -77,6 +77,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
+ 
+ import vllm_ascend.envs as envs_ascend
+ from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
++from vllm_ascend.core.kv_cache_memory import uses_minimax_pp_group_compensation
+ from vllm_ascend.batch_invariant import init_batch_invariance
+ from vllm_ascend.core.kv_cache_placement import (
+     KVPPPhysicalCachePlan,
+@@ -660,6 +661,26 @@ class NPUWorker(WorkerBase):
+         """
+         GiB = lambda b: b / GiB_bytes
+ 
++        if uses_minimax_pp_group_compensation(self.vllm_config):
++            pp = get_pp_group()
++            token = torch.zeros(1, dtype=torch.int64, device=self.device)
++            for source in range(pp.world_size - 1):
++                if pp.rank_in_group == source:
++                    torch.distributed.isend(
++                        token, dst=pp.ranks[source + 1], group=pp.device_group
++                    ).wait()
++                elif pp.rank_in_group == source + 1:
++                    torch.distributed.irecv(
++                        token, src=pp.ranks[source], group=pp.device_group
++                    ).wait()
++            torch.distributed.broadcast(
++                token, src=pp.last_rank,
++                group=self.model_runner.pp_handler.broadcast_group,
++            )
++            torch.npu.synchronize()
++            del token
++            torch.npu.empty_cache()
++
+         maybe_apply_startup_plan(self)
+ 
+         randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and self.parallel_config.data_parallel_size > 1
+@@ -769,6 +790,8 @@ class NPUWorker(WorkerBase):
+         derives a num_blocks (and block pool) small enough for the per-layer
+         buffers to fit.
+         """
++        if uses_minimax_pp_group_compensation(self.vllm_config):
++            return available_memory
+         kv_cache_spec = self.get_kv_cache_spec()
+         if not isinstance(kv_cache_spec, dict):
+             return available_memory
+@@ -936,6 +959,11 @@ class NPUWorker(WorkerBase):
+ 
+     @torch.inference_mode()
+     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
++        if uses_minimax_pp_group_compensation(self.vllm_config):
++            for handle in self._pp_send_work:
++                handle.wait()
++            self._pp_send_work = []
++            torch.npu.current_stream().synchronize()
+         output = self.model_runner.sample_tokens(grammar_output)
+         _attach_profiling_chunk_execution_time(
+             self.model_runner.ascend_config.scheduler_config.profiling_chunk_config,
+-- 
+2.53.0.windows.1
+
