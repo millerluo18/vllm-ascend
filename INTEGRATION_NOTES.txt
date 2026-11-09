@@ -1,0 +1,14 @@
+Source preparation completed inside vllm-a3-test; persistent host/container path /data/work.
+vllm-latest: main 3f898e55c6f82378a342e72728c7afe2b6ed7697 + PR63745 47b8d46db19a3bddccd9998f459f5ca4aa9c72fa, branch integration/pr-63745.
+vllm-ascend-latest: main 6db08e5ad213086f6339b08e214b2b23aebdac89 + PR19868 bd9224271864bea497e03f8c81493eac030b86f8, branch integration/pr-19868.
+Changes are recorded in this commit; packages are not installed from these trees. Latest main refs were captured on 2026-11-09.
+Ascend official verified vLLM ref: 24420b7a341af37a9bc3186e6fc6062512e0aa58, dated 2026-10-30. This is recorded for reference; both integration trees use latest main as requested.
+Original PR patches: pr63745-original.patch, pr19868-original.patch.
+Rebased patches: pr63745-on-latest.patch, pr19868-on-latest.patch.
+Conflicts resolved in vllm GPU worker (retain main pooling API plus PR cancellation) and Mooncake CI (retain main dependency check plus PR native test).
+Python AST parse, staged diff whitespace and unresolved-conflict checks passed. Static shared PPRuntime method-name check passed; this is not a runtime compatibility guarantee.
+Existing targeted PP unit run: 67 passed, 37 failed, interrupted after repeated failures were identified. Log /data/tasks/pr63745-unit-tests.log.
+Failure categories: latest VllmConfig removed use_v2_model_runner (19 failures); latest NewRequestData requires prefill_token_ids absent in PR tests (18 failures).
+Runtime adaptation, complete unit/E2E verification and model accuracy/performance tests remain pending. No successful PR runtime result is claimed.
+Container installed vLLM/vLLM Ascend remain stock 0.30.0. Do not treat source checkout as an editable installation.
+Validation command (cwd /data/work/vllm-latest): VLLM_PLUGINS= VLLM_TARGET_DEVICE=cpu /opt/check-venv/bin/python -m pytest --noconftest -q tests/v1/worker/test_pp_boundary.py tests/v1/worker/test_pp_buffer.py tests/v1/worker/test_pp_config.py
