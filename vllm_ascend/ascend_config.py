@@ -948,7 +948,11 @@ class AscendConfig:
             from vllm_ascend.utils import enable_sp
 
             get_pp_config(vc)
-            if enable_sp(vc) or self.enable_dsa_cp:
+            if (
+                enable_sp(vc)
+                or vc.parallel_config.prefill_context_parallel_size > 1
+                or vc.parallel_config.decode_context_parallel_size > 1
+            ):
                 raise ValueError("PP buffering does not yet support Ascend sequence/context parallelism")
         return self
 
