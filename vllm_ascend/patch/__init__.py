@@ -893,6 +893,12 @@
 #       Remove this patch when vLLM Ascend depends on a vLLM version that includes
 #       PR #45895.
 #
+#   2. Dynamic PP extends the GLM DSA model initialization and forward ranges.
+#    Why: PR #63745 requires model-owned replicas and per-batch layer selection.
+#    How: Load boundary replicas and carry shared Top-K indices across every cut.
+#    Related PR: https://github.com/vllm-project/vllm/pull/63745
+#    Future Plan: Replace this patch with upstream model extension hooks.
+#
 # ** 3. File: worker/patch_distributed.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.distributed.parallel_state.GroupCoordinator`

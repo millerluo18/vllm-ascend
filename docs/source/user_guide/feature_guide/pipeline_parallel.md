@@ -462,3 +462,12 @@ adjusts chunk sizes using measured execution time to reduce stage idle time.
 - [PD Disaggregation with Mooncake](../../tutorials/features/pd_disaggregation_mooncake_multi_node.md)
 - [Performance Benchmark](../../developer_guide/performance_and_debug/performance_benchmark.md)
 - [Service Profiling Guide](../../developer_guide/performance_and_debug/service_profiling_guide.md)
+
+## Experimental dynamic prefill partitioning
+
+DeepSeek-V4 and GLM-5.3 can use the experimental PP2 fresh-prefill adapter
+with one output token per request. It requires the matching vLLM dynamic PP branch
+and supports eager Model Runner V2 without chunked prefill, prefix caching,
+speculation, EP, DP or context parallelism. See the
+[dynamic PP prefill guide](../../developer_guide/Design_Documents/dynamic_pp_prefill.md)
+for configuration, replicated-weight memory costs and validation.

@@ -1,0 +1,4 @@
+pr: 19868
+entries:
+  - category: feature
+    text: Added experimental GLM-5.3 dynamic PP2 fresh-prefill support with one output token and shared Top-K transport on Model Runner V2.

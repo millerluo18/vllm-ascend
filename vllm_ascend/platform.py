@@ -99,6 +99,10 @@ _V2_STAIR_CONFIG_FIELDS = frozenset(StairConfig.__dataclass_fields__)
 
 
 class NPUPlatform(Platform):
+    @classmethod
+    def supports_dynamic_pp_index_reuse(cls, hf_config) -> bool:
+        return getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+
     _enum = PlatformEnum.OOT
     device_name: str = "npu"
     device_type: str = "npu"

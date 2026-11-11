@@ -95,6 +95,8 @@ def test_forward_compilation_does_not_trigger_buffer_mutation_guard(monkeypatch,
         layers=[lambda positions, hidden, residual, scaling: (hidden + 1, hidden)],
         start_layer=0,
         end_layer=1,
+        pp_prefill_execution_range=(0, 1),
+        _pp_moe_layer_names=None,
         aux_hidden_state_layers=(0,),
         _use_upstream_aux_relay=native,
         send_pp_topk_indices=False,
@@ -150,6 +152,8 @@ def test_aux_relay_matches_unpartitioned_forward(monkeypatch, native, boundaries
             model.config = SimpleNamespace(hidden_size=2)
             model.hidden_size = 2
             model.start_layer, model.end_layer = start, end
+            model.pp_prefill_execution_range = start, end
+            model._pp_moe_layer_names = None
             model.layers = [layer] * 78
             model.aux_hidden_state_layers = aux_layers
             model._use_upstream_aux_relay = native
@@ -197,12 +201,14 @@ def test_aux_relay_matches_unpartitioned_forward(monkeypatch, native, boundaries
 @pytest.mark.parametrize("v2", [False, True])
 def test_aux_buffer_factory_uses_one_protocol(monkeypatch, v2):
     factory = object()
-    model = SimpleNamespace(layers=[], make_empty_intermediate_tensors=factory)
+    model = SimpleNamespace(layers=[], start_layer=0, end_layer=0, make_empty_intermediate_tensors=factory)
     monkeypatch.setattr(patch_deepseek_v2, "_original_deepseek_v2_model_init", lambda *args, **kwargs: None)
     wrapped = object()
     wrap_factory = Mock(return_value=wrapped)
     monkeypatch.setattr(patch_deepseek_v2.pp_transport, "make_empty_intermediate_tensors", wrap_factory)
-    patch_deepseek_v2._patched_deepseek_v2_model_init(model, vllm_config=SimpleNamespace(use_v2_model_runner=v2))
+    patch_deepseek_v2._patched_deepseek_v2_model_init(
+        model, vllm_config=SimpleNamespace(use_v2_model_runner=v2, additional_config={})
+    )
     assert model._use_upstream_aux_relay is v2
     expected_data_types: tuple[PPTransportDataType, ...] = (PPTransportDataType.TOPK_INDICES,)
     if not model._use_upstream_aux_relay:
@@ -249,7 +255,7 @@ def test_model_init_adds_pp_topk_receive_buffer(monkeypatch):
 
     _patched_deepseek_v2_model_init(
         model,
-        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+        vllm_config=SimpleNamespace(use_v2_model_runner=True, additional_config={}),
         prefix="",
     )
     intermediate_tensors = model.make_empty_intermediate_tensors(
@@ -283,6 +289,8 @@ def test_pp_forward_propagates_aliased_topk_indices(monkeypatch):
         layers=[lambda positions, hidden_states, residual, scaling: (hidden_states, residual)],
         start_layer=0,
         end_layer=1,
+        pp_prefill_execution_range=(0, 1),
+        _pp_moe_layer_names=None,
         aux_hidden_state_layers=(),
     )
     intermediate_tensors = add_pp_transport_tensors(
@@ -388,3 +396,32 @@ def test_make_empty_intermediate_tensors_aux_and_topk(monkeypatch, topk_mode):
     topk = get_pp_transport_tensors(result, PPTransportDataType.TOPK_INDICES)
     assert len(aux) == 2 and len(topk) == 1
     assert topk[0].data_ptr() == topk_buffer.data_ptr()
+
+
+@pytest.mark.parametrize("end", [3, 5])
+def test_dynamic_pp_forward_uses_batch_boundary(monkeypatch, end):
+    """Moving the cut executes the selected layers and preserves the top-k payload."""
+    group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
+    monkeypatch.setattr(patch_deepseek_v2, "get_pp_group", lambda: group)
+    topk = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    layers = [
+        lambda positions, hidden, residual, scaling, index=index: (hidden + 2**index, torch.zeros_like(hidden))
+        for index in range(6)
+    ]
+    model = SimpleNamespace(
+        config=SimpleNamespace(llama_4_scaling=None),
+        layers=layers,
+        start_layer=0,
+        end_layer=4,
+        pp_prefill_execution_range=(0, end),
+        _pp_moe_layer_names=None,
+        aux_hidden_state_layers=(),
+        _use_upstream_aux_relay=False,
+        send_pp_topk_indices=True,
+        topk_indices_buffer=topk,
+        embed_input_ids=lambda ids: torch.zeros(len(ids), 2),
+    )
+    ids = torch.zeros(2, dtype=torch.long)
+    output = _patched_forward(model, ids, ids, None)
+    torch.testing.assert_close(output["hidden_states"], torch.full((2, 2), float(2**end - 1)))
+    torch.testing.assert_close(get_pp_transport_tensors(output, PPTransportDataType.TOPK_INDICES)[0], topk)

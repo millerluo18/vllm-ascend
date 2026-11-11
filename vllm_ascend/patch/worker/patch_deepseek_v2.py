@@ -23,6 +23,7 @@ from vllm.model_executor.layers.mla import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import (
+    DeepseekV2DecoderLayer,
     DeepseekV2ForCausalLM,
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV2MLAAttention,
@@ -310,11 +311,51 @@ def _patched_deepseek_v2_model_init(self, *args, **kwargs):
     # V2 relays aux slots upstream; V1 still uses the Ascend tensor payload.
     self._use_upstream_aux_relay = kwargs["vllm_config"].use_v2_model_runner
     self.topk_indices_buffer = _find_topk_indices_buffer(self.layers)
+    self.pp_prefill_execution_range = self.start_layer, self.end_layer
+    self._pp_boundary_controller = None
+    self._pp_moe_layer_names = None
+    self._pp_layer_prefix = f"{kwargs.get('prefix', '')}.layers"
+    vllm_config = kwargs["vllm_config"]
+    values = (vllm_config.additional_config or {}).get("dynamic_pp_config", {})
+    if values.get("enabled", False):
+        from vllm.model_executor.models.utils import PPMissingLayer
+        from vllm.v1.worker.pp.boundary import DynamicPPConfig, PPBoundaryController
+
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        if self.config.model_type != "glm_moe_dsa":
+            raise ValueError("This dynamic PP adapter supports GLM DSA only")
+        dynamic = DynamicPPConfig.from_mapping(values)
+        dynamic.validate_runtime(vllm_config, get_ascend_config().pp_send_buffer_size)
+        rank = get_pp_group().rank_in_group
+        base = self.end_layer if rank == 0 else self.start_layer
+        controller = PPBoundaryController(
+            dynamic,
+            base,
+            self.config.num_hidden_layers,
+            self.config.first_k_dense_replace,
+        )
+        self._pp_boundary_controller = controller
+        loaded_start, loaded_end = controller.loaded_range(rank)
+        # Ascend MLA shares the same top-k buffer across backbone layers.
+        for layer_idx in range(loaded_start, loaded_end):
+            if isinstance(self.layers[layer_idx], PPMissingLayer):
+                self.layers[layer_idx] = DeepseekV2DecoderLayer(
+                    vllm_config=vllm_config,
+                    prefix=f"{self._pp_layer_prefix}.{layer_idx}",
+                    topk_indices_buffer=self.topk_indices_buffer,
+                )
+        self._pp_moe_layer_names = tuple(vllm_config.compilation_config.static_all_moe_layers)
     transport_data_type_list = [PPTransportDataType.TOPK_INDICES]
     if not self._use_upstream_aux_relay:
         transport_data_type_list.insert(0, PPTransportDataType.AUX_HIDDEN_STATES)
     transport_data_types = tuple(transport_data_type_list)
     configure_pp_topk_transport(self, transport_data_types)
+    if self._pp_boundary_controller is not None:
+        # The receive schema must cover every boundary the controller can choose.
+        self.receive_pp_topk_indices = True
+        self.send_pp_topk_indices = not get_pp_group().is_last_rank
+
     self.make_empty_intermediate_tensors = pp_transport.make_empty_intermediate_tensors(
         self,
         self.make_empty_intermediate_tensors,
@@ -401,9 +442,24 @@ def _patched_forward(
 
     if pp_group.is_first_rank:
         _capture_aux_hidden_state(self, aux_hidden_states, 0, hidden_states, residual, positions)
+    start_layer, end_layer = self.pp_prefill_execution_range
+    if self._pp_moe_layer_names is not None:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+        from vllm.v1.worker.pp.boundary import select_pp_moe_layer_names
+
+        if is_forward_context_available():
+            context = get_forward_context()
+            if context.all_moe_layers is not None:
+                context.all_moe_layers = select_pp_moe_layer_names(
+                    self._pp_moe_layer_names,
+                    self._pp_layer_prefix,
+                    max(start_layer, self.config.first_k_dense_replace),
+                    end_layer,
+                )
+                context.moe_layer_index = 0
     for idx, layer in enumerate(
-        islice(self.layers, self.start_layer, self.end_layer),
-        start=self.start_layer,
+        islice(self.layers, start_layer, end_layer),
+        start=start_layer,
     ):
         hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
         # A boundary state belongs to the stage producing it, including end_layer.

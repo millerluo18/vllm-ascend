@@ -78,6 +78,28 @@ class AscendGlmMoeDsaForCausalLM(GlmMoeDsaForCausalLM):
             # EPLB maps and expert weights must describe the same local layers.
             self.num_moe_layers = len(self.moe_layers)
 
+    def get_dynamic_pp_layer_spec(self):
+        from vllm.distributed import get_pp_group
+        from vllm.v1.worker.pp.interface import PPLayerSpec
+
+        pp = get_pp_group()
+        return PPLayerSpec(
+            self.model.end_layer if pp.is_first_rank else self.model.start_layer,
+            self.config.num_hidden_layers,
+            self.config.first_k_dense_replace,
+        )
+
+    def set_dynamic_pp_layer_range(self, start: int, end: int) -> None:
+        from vllm.distributed import get_pp_group
+
+        controller = self.model._pp_boundary_controller
+        if controller is None:
+            raise ValueError("Dynamic PP replicas were not loaded")
+        loaded_start, loaded_end = controller.loaded_range(get_pp_group().rank_in_group)
+        if not loaded_start <= start < end <= loaded_end:
+            raise ValueError("Dynamic PP execution range exceeds loaded replicas")
+        self.model.pp_prefill_execution_range = start, end
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = WeightsMapper(orig_to_new_prefix={"rot.": None})
         loader = AutoWeightsLoader(self)

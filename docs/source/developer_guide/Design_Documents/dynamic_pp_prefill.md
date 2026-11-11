@@ -1,7 +1,7 @@
 # Experimental dynamic PP prefill
 
 This prototype connects Ascend Model Runner V2 to the shared vLLM activation
-buffer and dynamic PP runtime. Each PP stage loads overlapping DSV4 layers and
+buffer and dynamic PP runtime. Each PP stage loads overlapping DeepSeek-V4 or GLM DSA layers and
 executes the range carried with each batch. Device-completed producer work,
 consumer credits, and matched stage timings guide the split. The default is
 unchanged: no output ring and no boundary movement.
@@ -13,7 +13,7 @@ shared implementation lives in `vllm/v1/worker/pp/`; this plugin does not mainta
 another controller or buffer implementation. Ordinary configurations do not
 import that optional module.
 
-The first adapter supports DeepSeek-V4 complete fresh prefills with one output
+The adapters support DeepSeek-V4 and GLM-5.3 complete fresh prefills with one output
 token, eager execution, PP=2 and TP. Prefix caching, chunked prefill, decode, KV
 connectors and pooling, speculation, LoRA, DP, EP, sequence/context parallelism,
 and microbatching are outside this version. Historical KV replication is not
@@ -73,3 +73,23 @@ then checks twelve changing-size payloads and paired device timings. The
 four-card model regression compares actual DSV4 checkpoint outputs with fixed
 PP, including both cut directions and adaptive feedback. Performance claims
 require a separate end-to-end comparison under sustained load.
+
+## GLM-5.3 adapter
+
+GLM-5.3 uses the GLM DSA model adapter with the same PP2 fresh-prefill
+restrictions. Use its Ascend W8A8C8 weights, `--kv-cache-dtype int8`, and
+`--attention_config.indexer_kv_dtype int8`; omit `--tokenizer-mode deepseek_v4`.
+Keep EP, speculation, prefix caching and chunked prefill disabled and use eager
+Model Runner V2. The existing `dynamic_pp_config` options select the replicated
+layer range. Dense prefix layers stay on PP0.
+
+The adapter loads overlapping layers before weight loading and updates MoE dispatch
+to match each batch. It always includes shared Top-K indices in the buffered PP
+payload because a moving cut can enter a shared-indexer group. This adds memory
+and transfer overhead; ordinary static PP retains its existing payload schema.
+Long-context capacity must be measured for the selected token budget and buffer
+count rather than inferred from the model context limit.
+
+The GLM worker patch targets the paired vLLM dynamic PP interface in PR #63745.
+Move replica construction and execution-range hooks to an upstream model extension
+point when available, then remove this part of the Ascend patch.
