@@ -1149,6 +1149,42 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
+        self.pp_prefill_execution_range = self.start_layer, self.end_layer
+        self._pp_boundary_controller = None
+        self._pp_moe_layer_names = None
+        self._pp_layer_prefix = f"{prefix}.layers"
+        values = (getattr(vllm_config, "additional_config", None) or {}).get("dynamic_pp_config", {})
+        if values.get("enabled", False):
+            from vllm.v1.worker.pp.boundary import DynamicPPConfig, PPBoundaryController
+
+            from vllm_ascend.ascend_config import get_ascend_config
+
+            dynamic = DynamicPPConfig.from_mapping(values)
+            dynamic.validate_runtime(vllm_config, get_ascend_config().pp_send_buffer_size)
+            frequencies = getattr(config, "moe_layer_freq", None)
+            first_moe = (
+                next((index for index, value in enumerate(frequencies) if value), 0) if frequencies is not None else 0
+            )
+            if frequencies is not None and not all(frequencies[first_moe:]):
+                raise ValueError("Dynamic MiniMax PP requires a contiguous MoE suffix")
+            rank = get_pp_group().rank_in_group
+            base = self.end_layer if rank == 0 else self.start_layer
+            controller = PPBoundaryController(dynamic, base, self.num_hidden_layers, max(1, first_moe))
+            self._pp_boundary_controller = controller
+            loaded_start, loaded_end = controller.loaded_range(rank)
+            for index in range(loaded_start, loaded_end):
+                if isinstance(self.layers[index], PPMissingLayer):
+                    self.layers[index] = MiniMaxM3DecoderLayer(
+                        config,
+                        f"{self._pp_layer_prefix}.{index}",
+                        model_config=model_config,
+                        parallel_config=vllm_config.parallel_config,
+                        cache_config=cache_config,
+                        quant_config=quant_config,
+                    )
+            self._pp_first_moe = first_moe
+            self._pp_moe_layer_names = tuple(vllm_config.compilation_config.static_all_moe_layers)
+
         if get_pp_group().is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1192,9 +1228,22 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             sp_forward_context = get_forward_context()
             original_is_padding = sp_forward_context.is_padding
+        start_layer, end_layer = self.pp_prefill_execution_range
+        if self._pp_moe_layer_names is not None and is_forward_context_available():
+            from vllm.v1.worker.pp.boundary import select_pp_moe_layer_names
+
+            context = get_forward_context()
+            if context.all_moe_layers is not None:
+                context.all_moe_layers = select_pp_moe_layer_names(
+                    self._pp_moe_layer_names,
+                    self._pp_layer_prefix,
+                    max(start_layer, self._pp_first_moe),
+                    end_layer,
+                )
+                context.moe_layer_index = 0
         for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
+            islice(self.layers, start_layer, end_layer),
+            start=start_layer,
         ):
             if sp_forward_context is not None:
                 if layer.use_sequence_parallel and not hidden_states_are_sp:
@@ -1483,6 +1532,29 @@ class MiniMaxM3SparseForCausalLM(
 
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
         self._set_moe_parameters()
+
+    def get_dynamic_pp_layer_spec(self):
+        from vllm.v1.worker.pp.interface import PPLayerSpec
+
+        model = self.model
+        controller = model._pp_boundary_controller
+        if controller is None:
+            raise ValueError("Dynamic MiniMax PP replicas were not loaded")
+        return PPLayerSpec(
+            model.end_layer if get_pp_group().is_first_rank else model.start_layer,
+            model.num_hidden_layers,
+            max(1, model._pp_first_moe),
+        )
+
+    def set_dynamic_pp_layer_range(self, start: int, end: int) -> None:
+        model = self.model
+        controller = model._pp_boundary_controller
+        if controller is None:
+            raise ValueError("Dynamic MiniMax PP replicas were not loaded")
+        loaded_start, loaded_end = controller.loaded_range(get_pp_group().rank_in_group)
+        if not loaded_start <= start < end <= loaded_end:
+            raise ValueError("Dynamic MiniMax PP execution exceeds loaded replicas")
+        model.pp_prefill_execution_range = start, end
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

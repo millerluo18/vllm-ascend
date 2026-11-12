@@ -93,3 +93,18 @@ count rather than inferred from the model context limit.
 The GLM worker patch targets the paired vLLM dynamic PP interface in PR #63745.
 Move replica construction and execution-range hooks to an upstream model extension
 point when available, then remove this part of the Ascend patch.
+
+
+## MiniMax-M3.1-Flash adapter
+
+The Ascend MiniMax text model and multimodal wrapper expose the same PP2
+fresh-prefill interface. Boundary replicas are created before checkpoint loading;
+each batch selects its execution range and corresponding MoE dispatch entries.
+The current adapter requires a contiguous MoE suffix after the dense prefix.
+
+Use A3 W8A8 weights, Model Runner V2, PP2 with TP, eager execution, and one output
+token. Disable speculation, prefix caching, chunked prefill, EP, DP and sequence
+parallelism. Set both the model and batch token budgets to fit the complete input.
+Start with a short context and verify actual boundary movement before testing
+long inputs; replicated layers and send slots consume additional memory.
+This adapter does not add DSpark, graph execution, decode or historical KV support.

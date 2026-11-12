@@ -409,6 +409,12 @@ class MiniMaxM3SparseForConditionalGeneration(
             inputs_embeds=inputs_embeds,
         )
 
+    def get_dynamic_pp_layer_spec(self):
+        return self.language_model.get_dynamic_pp_layer_spec()
+
+    def set_dynamic_pp_layer_range(self, start: int, end: int) -> None:
+        self.language_model.set_dynamic_pp_layer_range(start, end)
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 

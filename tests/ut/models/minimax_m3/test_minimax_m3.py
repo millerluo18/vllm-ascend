@@ -128,6 +128,66 @@ def _make_decoder_layer(*, use_sequence_parallel: bool, is_moe: bool = True) -> 
 
 
 class TestMiniMaxM3Modeling(unittest.TestCase):
+    def test_dynamic_pp_executes_loaded_boundary_replica(self):
+        """Moving the cut executes the replica, and unloaded ranges are rejected."""
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        from vllm_ascend.models.minimax_m3.minimax_m3 import (
+            MiniMaxM3SparseForCausalLM,
+        )
+
+        class TargetLayer(nn.Module):
+            use_sequence_parallel = False
+
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.index = int(args[1].rsplit(".", 1)[1])
+
+            def forward(self, positions, hidden_states, residual, **kwargs):
+                return hidden_states + self.index + 1, hidden_states
+
+        module = "vllm_ascend.models.minimax_m3.minimax_m3"
+        text = SimpleNamespace(
+            vocab_size=16,
+            hidden_size=4,
+            num_hidden_layers=6,
+            rms_norm_eps=1e-6,
+            moe_layer_freq=[0, 1, 1, 1, 1, 1],
+        )
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=text),
+            cache_config=None,
+            quant_config=None,
+            speculative_config=None,
+            parallel_config=SimpleNamespace(),
+            compilation_config=SimpleNamespace(mode=CompilationMode.NONE, static_all_moe_layers=[]),
+            additional_config={"dynamic_pp_config": {"enabled": True, "redundant_layers": 1}},
+        )
+        layers = nn.ModuleList(
+            [TargetLayer(None, f"model.layers.{i}") if i < 3 else PPMissingLayer() for i in range(6)]
+        )
+        rank = SimpleNamespace(is_first_rank=True, is_last_rank=False, rank_in_group=0)
+        with (
+            patch(f"{module}.get_pp_group", return_value=rank),
+            patch(f"{module}.VocabParallelEmbedding", return_value=nn.Embedding(16, 4)),
+            patch(f"{module}.make_layers", return_value=(0, 3, layers)),
+            patch(f"{module}.MiniMaxM3DecoderLayer", TargetLayer),
+            patch(f"{module}.make_pp_empty_intermediate_tensors"),
+            patch("vllm.v1.worker.pp.boundary.DynamicPPConfig.validate_runtime"),
+            patch("vllm_ascend.ascend_config.get_ascend_config", return_value=SimpleNamespace(pp_send_buffer_size=2)),
+        ):
+            model = MiniMaxM3Model(vllm_config=config, prefix="model")
+            model.set_aux_hidden_state_layers(())
+            wrapper = MiniMaxM3SparseForCausalLM.__new__(MiniMaxM3SparseForCausalLM)
+            nn.Module.__init__(wrapper)
+            wrapper.model = model
+            self.assertIsInstance(model.layers[4], PPMissingLayer)
+            wrapper.set_dynamic_pp_layer_range(0, 4)
+            result = model(None, torch.arange(2), None, inputs_embeds=torch.ones(2, 4))
+            torch.testing.assert_close(result["hidden_states"], torch.full((2, 4), 11.0))
+            with self.assertRaisesRegex(ValueError, "loaded replicas"):
+                wrapper.set_dynamic_pp_layer_range(0, 5)
+
     def test_dspark_receives_residual_added_auxiliary_states(self):
         class _TargetLayer(nn.Module):
             use_sequence_parallel = False
@@ -292,6 +352,8 @@ class TestMiniMaxM3Modeling(unittest.TestCase):
         model.do_not_compile = True
         model.start_layer = 0
         model.end_layer = 1
+        model.pp_prefill_execution_range = (0, 1)
+        model._pp_moe_layer_names = None
         model.layers = nn.ModuleList([_SequenceParallelLayer()])
         model.aux_hidden_state_layers = set()
         model._maybe_add_hidden_state = MethodType(lambda self, states, *_args: states, model)

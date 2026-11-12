@@ -1,0 +1,6 @@
+pr: 19868
+entries:
+  - category: feature
+    text: Added experimental MiniMax-M3.1-Flash dynamic PP2 fresh-prefill support on Ascend with eager Model Runner V2 and one output token.
+    model: MiniMax-M3.1-Flash
+    hardware: [A3]
