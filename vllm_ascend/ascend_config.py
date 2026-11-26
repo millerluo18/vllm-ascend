@@ -588,6 +588,7 @@ class AscendConfig:
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     pp_send_buffer_size: int = 0
+    pp_recv_buffer_size: int = 0
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
@@ -664,6 +665,8 @@ class AscendConfig:
     def _validate_user_input_ranges(self):
         if self.pp_send_buffer_size < 0:
             raise ValueError("pp_send_buffer_size must be non-negative")
+        if self.pp_recv_buffer_size < 0:
+            raise ValueError("pp_recv_buffer_size must be non-negative")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -937,19 +940,14 @@ class AscendConfig:
 
         # sparse KV offload vs packed SFA main cache mutex
         self._validate_sparse_packed_kv_offload_compatibility()
-        if self.pp_send_buffer_size:
-            from vllm_ascend.worker.pp.config import get_pp_send_buffer_size
-
-            from vllm_ascend.utils import enable_sp
+        if self.pp_send_buffer_size or self.pp_recv_buffer_size:
+            from vllm_ascend.worker.pp.config import get_pp_recv_buffer_size, get_pp_send_buffer_size
 
             get_pp_send_buffer_size(vc)
+            get_pp_recv_buffer_size(vc)
             parallel = vc.parallel_config
-            if (
-                enable_sp(vc)
-                or parallel.prefill_context_parallel_size > 1
-                or parallel.decode_context_parallel_size > 1
-            ):
-                raise ValueError("PP buffering does not yet support Ascend sequence/context parallelism")
+            if parallel.prefill_context_parallel_size > 1 or parallel.decode_context_parallel_size > 1:
+                raise ValueError("PP buffering does not yet support Ascend context parallelism")
         return self
 
     @property

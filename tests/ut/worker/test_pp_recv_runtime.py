@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_ascend.worker.pp.buffer import PPRecvBuffer
 from vllm_ascend.worker.pp.config import get_pp_recv_buffer_size
@@ -182,3 +183,68 @@ def test_invalid_receive_size_is_rejected(size):
     config = SimpleNamespace(additional_config={"pp_recv_buffer_size": size}, use_v2_model_runner=True)
     with pytest.raises(ValueError, match="pp_recv_buffer_size"):
         get_pp_recv_buffer_size(config)
+
+
+@pytest.mark.parametrize("gather", [False, True])
+def test_receive_budget_includes_all_slots_and_optional_reconstruction_workspace(gather):
+    device = Device()
+    runtime = PPRecvBuffer(5, device, receiver(device))
+    runtime.reserve(
+        {"hidden_states": torch.empty(7, 4), "topk": torch.empty(7, 2, dtype=torch.int32)}, all_gather=gather
+    )
+    assert runtime.max_batch_bytes == 7 * (4 + 2) * 4
+    assert runtime.budget_bytes == (5 + int(gather)) * runtime.max_batch_bytes
+
+
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "key", "duplicate"])
+def test_receive_rejects_unbudgeted_metadata_before_tensor_allocation(invalid):
+    device = Device()
+
+    class Group:
+        def recv_object(self):
+            key = "other" if invalid == "key" else "hidden_states"
+            metadata = [
+                (
+                    key,
+                    SimpleNamespace(
+                        size=(8 if invalid == "shape" else 3, 4),
+                        dtype=torch.float64 if invalid == "dtype" else torch.float32,
+                        device="cpu",
+                    ),
+                )
+            ]
+            return metadata * (2 if invalid == "duplicate" else 1)
+
+        def irecv_tensor_dict(self, all_gather_group):
+            self.recv_object()
+            raise AssertionError("Invalid metadata must fail before allocation")
+
+    group = Group()
+    runtime = PPRecvBuffer(2, device, group)
+    runtime.reserve({"hidden_states": torch.empty(7, 4)})
+    with pytest.raises(ValueError, match="budget|Duplicate"):
+        runtime.receive(None)
+
+
+def test_budgeted_receive_accepts_smaller_batch_and_preserves_original_group():
+    device = Device()
+
+    class Group:
+        def recv_object(self):
+            return [("hidden_states", SimpleNamespace(size=(3, 4), dtype=torch.float32, device="cpu"))]
+
+        def irecv_tensor_dict(self, all_gather_group):
+            metadata = self.recv_object()
+            key, value = metadata[0]
+            return {key: torch.empty(value.size, dtype=value.dtype)}, [], []
+
+    group = Group()
+    original = group.recv_object
+    runtime = PPRecvBuffer(2, device, group)
+    runtime.reserve({"hidden_states": torch.empty(7, 4)})
+    tensors, handles, _ = runtime.receive(None)
+    assert tensors["hidden_states"].shape == (3, 4)
+    assert group.recv_object == original
+    handles[0].wait()
+    runtime.release()
+    runtime.drain()

@@ -729,9 +729,13 @@ class NPUWorker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
         if self._pp_send_runtime is not None and self._pp_send_runtime.buffer is not None:
-            # Ascend profiling counts model weights and activation growth,
-            # so separately budget persistent snapshots allocated after loading.
-            self.available_kv_cache_memory_bytes -= self._pp_send_runtime.buffer.reserved_bytes
+            # Budget both snapshots and dynamic outputs retained by send slots.
+            self.available_kv_cache_memory_bytes -= self._pp_send_runtime.buffer.budget_bytes
+        if self._pp_recv_runtime is not None:
+            # Profile runs do not exercise the retained multi-batch receive queue.
+            self.available_kv_cache_memory_bytes -= self._pp_recv_runtime.budget_bytes
+        if self.available_kv_cache_memory_bytes <= 0:
+            raise ValueError("Insufficient KV memory after reserving PP communication buffers")
         self.available_kv_cache_memory_bytes = self._scale_kv_cache_memory_for_multi_group(
             self.available_kv_cache_memory_bytes,
         )
@@ -912,7 +916,8 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
         try:
-            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+            with runtime.protect_outputs() if runtime is not None else nullcontext():
+                output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         except Exception:
             if runtime is not None:
                 runtime.cancel()
@@ -934,7 +939,7 @@ class NPUWorker(WorkerBase):
         else:
             all_gather_group = get_tp_group()
         if runtime is not None and runtime.buffer is not None:
-            runtime.send(output.tensors)
+            runtime.send(output.tensors, all_gather_group=all_gather_group)
         else:
             self._pp_send_work = get_pp_group().isend_tensor_dict(
                 output.tensors,
@@ -1002,6 +1007,14 @@ class NPUWorker(WorkerBase):
             from vllm_ascend.worker.pp.buffer import PPRecvBuffer
 
             self._pp_recv_runtime = PPRecvBuffer(recv_size, torch.npu, get_pp_group())
+            recv_template = self.model_runner.model.make_empty_intermediate_tensors(
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
+            self._pp_recv_runtime.reserve(recv_template.tensors, all_gather=get_tp_group().world_size > 1)
+            del recv_template
+
         if additional.get("pp_send_buffer_size", 0):
             from vllm_ascend.worker.pp.runtime import PPSendRuntime
 
@@ -1012,6 +1025,7 @@ class NPUWorker(WorkerBase):
                 torch.npu,
                 get_pp_group(),
                 get_tp_group(),
+                model_runner=self.model_runner,
             )
 
         if self.vllm_config.weight_transfer_config is not None:
